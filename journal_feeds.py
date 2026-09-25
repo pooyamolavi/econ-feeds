@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build Atom feeds of new journal articles from the Crossref API.
+"""Build RSS 2.0 feeds of new journal articles from the Crossref API.
 
 Writes one feed per journal to docs/, plus docs/feeds.opml for importing
 all of them into a feed reader at once. Uses only the Python standard library.
@@ -15,19 +15,20 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from email.utils import format_datetime
 
 # ---------------------------------------------------------------------------
 # Journals to track. Add or remove lines freely; any ISSN of the journal works.
 # slug = file name of the feed (docs/<slug>.xml)
 # ---------------------------------------------------------------------------
 JOURNALS = [
-    # slug,             name,                                   ISSN
-    ("aer",             "American Economic Review",             "0002-8282"),
-    ("aer-insights",    "AER: Insights",                        "2640-205X"),
-    ("aej-macro",       "AEJ: Macroeconomics",                  "1945-7707"),
-    ("qje",             "Quarterly Journal of Economics",       "0033-5533"),
-    ("restud",          "Review of Economic Studies",           "0034-6527"),
-    ("rfs",             "Review of Financial Studies",          "0893-9454"),
+    # slug,          name,                              ISSN,        homepage
+    ("aer",          "American Economic Review",        "0002-8282", "https://www.aeaweb.org/journals/aer"),
+    ("aer-insights", "AER: Insights",                   "2640-205X", "https://www.aeaweb.org/journals/aeri"),
+    ("aej-macro",    "AEJ: Macroeconomics",             "1945-7707", "https://www.aeaweb.org/journals/mac"),
+    ("qje",          "Quarterly Journal of Economics",  "0033-5533", "https://academic.oup.com/qje"),
+    ("restud",       "Review of Economic Studies",      "0034-6527", "https://academic.oup.com/restud"),
+    ("rfs",          "Review of Financial Studies",     "0893-9454", "https://academic.oup.com/rfs"),
 ]
 
 ROWS = 40  # most recent articles kept in each feed
@@ -111,27 +112,37 @@ def to_entry(item):
     }
 
 
-def write_atom(path, feed_id, name, entries):
-    ns = "http://www.w3.org/2005/Atom"
-    ET.register_namespace("", ns)
-    feed = ET.Element(f"{{{ns}}}feed")
-    ET.SubElement(feed, f"{{{ns}}}title").text = name
-    ET.SubElement(feed, f"{{{ns}}}id").text = feed_id
-    ET.SubElement(feed, f"{{{ns}}}updated").text = (
-        entries[0]["updated"] if entries
-        else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-    ET.SubElement(feed, f"{{{ns}}}link", href=feed_id, rel="self")
+def rfc822(iso):
+    dt = datetime.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    return format_datetime(dt, usegmt=True)
+
+
+def write_rss(path, feed_url, name, homepage, entries):
+    atom = "http://www.w3.org/2005/Atom"
+    dc = "http://purl.org/dc/elements/1.1/"
+    ET.register_namespace("atom", atom)
+    ET.register_namespace("dc", dc)
+    rss = ET.Element("rss", version="2.0")
+    ch = ET.SubElement(rss, "channel")
+    ET.SubElement(ch, "title").text = name
+    ET.SubElement(ch, "link").text = homepage
+    ET.SubElement(ch, "description").text = f"New articles in {name} (via Crossref)"
+    ET.SubElement(ch, f"{{{atom}}}link", href=feed_url, rel="self",
+                  type="application/rss+xml")
+    now = format_datetime(datetime.now(timezone.utc), usegmt=True)
+    ET.SubElement(ch, "lastBuildDate").text = now
     for e in entries:
-        entry = ET.SubElement(feed, f"{{{ns}}}entry")
-        ET.SubElement(entry, f"{{{ns}}}title").text = e["title"]
-        ET.SubElement(entry, f"{{{ns}}}id").text = e["id"]
-        ET.SubElement(entry, f"{{{ns}}}link", href=e["id"])
-        ET.SubElement(entry, f"{{{ns}}}updated").text = e["updated"]
-        author = ET.SubElement(entry, f"{{{ns}}}author")
-        ET.SubElement(author, f"{{{ns}}}name").text = e["authors"]
-        summary = e["authors"] + (f"\n\n{e['abstract']}" if e["abstract"] else "")
-        ET.SubElement(entry, f"{{{ns}}}summary").text = summary
-    ET.ElementTree(feed).write(path, encoding="utf-8", xml_declaration=True)
+        it = ET.SubElement(ch, "item")
+        ET.SubElement(it, "title").text = e["title"]
+        ET.SubElement(it, "link").text = e["id"]
+        ET.SubElement(it, "guid", isPermaLink="true").text = e["id"]
+        ET.SubElement(it, "pubDate").text = rfc822(e["updated"])
+        ET.SubElement(it, f"{{{dc}}}creator").text = e["authors"]
+        desc = f"<p>{html.escape(e['authors'])}</p>"
+        if e["abstract"]:
+            desc += f"<p>{html.escape(e['abstract'])}</p>"
+        ET.SubElement(it, "description").text = desc
+    ET.ElementTree(rss).write(path, encoding="utf-8", xml_declaration=True)
 
 
 def base_url():
@@ -149,7 +160,7 @@ def write_opml(path, base):
     ET.SubElement(head, "title").text = "Economics journals (Crossref)"
     body = ET.SubElement(root, "body")
     folder = ET.SubElement(body, "outline", text="Crossref journals")
-    for slug, name, _ in JOURNALS:
+    for slug, name, _, _ in JOURNALS:
         ET.SubElement(folder, "outline", type="rss", text=name, title=name,
                       xmlUrl=f"{base}{slug}.xml")
     ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
@@ -159,7 +170,7 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     base = base_url()
     failures = 0
-    for slug, name, issn in JOURNALS:
+    for slug, name, issn, homepage in JOURNALS:
         try:
             items = fetch_works(issn)
         except RuntimeError as err:
@@ -168,8 +179,8 @@ def main():
             failures += 1
             continue
         entries = [e for e in (to_entry(i) for i in items) if e]
-        write_atom(os.path.join(OUT_DIR, f"{slug}.xml"),
-                   f"{base}{slug}.xml", name, entries)
+        write_rss(os.path.join(OUT_DIR, f"{slug}.xml"),
+                  f"{base}{slug}.xml", name, homepage, entries)
         print(f"{name}: {len(entries)} articles")
         time.sleep(1)  # be polite to Crossref
     write_opml(os.path.join(OUT_DIR, "feeds.opml"), base)
